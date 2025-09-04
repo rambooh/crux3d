@@ -2,7 +2,7 @@ import admin from "firebase-admin";
 
 // Zielpfad + Origin
 const TARGET_DOC_ID = "kBrk5tvWYTrQ8sBM3e87";
-const ORIGIN_URL    = "https://www.gant.com";
+const ORIGIN_URL    = "https://www.gant.com/";
 
 const { FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY, CRUX_API_KEY } = process.env;
 if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) throw new Error("Firebase ENV fehlt");

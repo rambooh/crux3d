@@ -1,5 +1,10 @@
 {
   "type": "module",
-  "scripts": { "ingest:one": "node ingest-one.mjs" },
-  "dependencies": { "firebase-admin": "^12.6.0" }
+  "scripts": {
+    "ingest:one": "node ingest-one.mjs",
+    "ingest:weekly": "node ingest-weekly.mjs"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.6.0"
+  }
 }

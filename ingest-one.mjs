@@ -1,8 +1,9 @@
 // ingest-daily-crux-raw.mjs
 import admin from "firebase-admin";
 
+// ---------- Config ----------
 const TARGET_DOC_ID = "kBrk5tvWYTrQ8sBM3e87";
-const ORIGIN_URL    = "https://gant.com"; // we'll try with and without www
+const ORIGIN_URL    = "https://gant.com";
 
 const { FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY, CRUX_API_KEY } = process.env;
 if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
@@ -10,6 +11,7 @@ if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
 }
 if (!CRUX_API_KEY) throw new Error("CRUX_API_KEY fehlt");
 
+// ---------- Firebase ----------
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -21,7 +23,15 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
-const CRUX_ENDPOINT = `https://chromeuxreport.googleapis.com/v1/records:queryRecord?key=${CRUX_API_KEY}`;
+// ---------- CrUX ----------
+const CRUX_DAILY = `https://chromeuxreport.googleapis.com/v1/records:queryRecord?key=${CRUX_API_KEY}`;
+
+const FORM_FACTORS = [
+  { api: "ALL_FORM_FACTORS", suffix: "all" },
+  { api: "PHONE",            suffix: "phone" },
+  { api: "DESKTOP",          suffix: "desktop" },
+  { api: "TABLET",           suffix: "tablet" }
+];
 
 const ymd = ({ year, month, day }) =>
   `${String(year).padStart(4,"0")}-${String(month).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
@@ -36,16 +46,19 @@ function variants(base) {
   return [a.toString(), b.toString()];
 }
 
-async function queryCruxAll(origin) {
-  // No "metrics" array → CrUX returns all available metrics for that key
-  const r = await fetch(CRUX_ENDPOINT, {
+async function queryDailyRaw(origin, formFactorApi) {
+  const body = formFactorApi === "ALL_FORM_FACTORS"
+    ? { origin }
+    : { origin, formFactor: formFactorApi };
+
+  const r = await fetch(CRUX_DAILY, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
-    body: JSON.stringify({ origin }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     const txt = await r.text();
-    const err = new Error(`CrUX ${r.status}: ${txt}`);
+    const err = new Error(`CrUX daily ${r.status}: ${txt}`);
     err.status = r.status;
     throw err;
   }
@@ -55,47 +68,64 @@ async function queryCruxAll(origin) {
 async function run() {
   const metricsDocRef = db.collection("metrics").doc(TARGET_DOC_ID);
 
+  // pick working origin (with/without www)
   let pickedOrigin = null;
-  let data = null;
-
+  let testData = null;
   for (const o of variants(ORIGIN_URL)) {
-    console.log("Trying origin:", o);
     try {
-      data = await queryCruxAll(o);
+      // probe with ALL_FORM_FACTORS to verify origin
+      testData = await queryDailyRaw(o, "ALL_FORM_FACTORS");
       pickedOrigin = o;
       break;
     } catch (e) {
+      if (e.status === 404) continue;
+      throw e;
+    }
+  }
+  if (!pickedOrigin || !testData?.record?.collectionPeriod) {
+    throw new Error("Keine CrUX-Daten für beide Varianten gefunden.");
+  }
+
+  // keep lightweight metadata on the metrics root
+  await metricsDocRef.set({ origin: true, url: pickedOrigin }, { merge: true });
+
+  // Determine date from the ALL snapshot (all form factors share the same period)
+  const w_end_all = ymd(testData.record.collectionPeriod.lastDate);
+
+  // Now fetch & store each form factor raw
+  for (const ff of FORM_FACTORS) {
+    let data;
+    try {
+      data = (ff.api === "ALL_FORM_FACTORS")
+        ? testData
+        : await queryDailyRaw(pickedOrigin, ff.api);
+    } catch (e) {
       if (e.status === 404) {
-        console.log("No data for:", o);
+        console.log(`No data for ${ff.api} — skipping`);
         continue;
       }
       throw e;
     }
+
+    const rec = data?.record;
+    if (!rec?.collectionPeriod) {
+      console.log(`Missing collectionPeriod for ${ff.api} — skipping`);
+      continue;
+    }
+
+    const w_end = ymd(rec.collectionPeriod.lastDate);
+    // Use the actual end date from this record (should match ALL, but keep robust)
+    const dayId = `${w_end}_${ff.suffix}`;
+
+    const payload = {
+      record: rec,                       // <-- raw CrUX record
+      source: "crux_api",
+      fetchedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await metricsDocRef.collection("daily-crux").doc(dayId).set(payload, { merge: false });
+    console.log(`OK: daily-crux/${dayId} (${ff.api})`);
   }
-
-  const rec = data?.record;
-  if (!pickedOrigin || !rec?.metrics || !rec?.collectionPeriod) {
-    throw new Error("Keine CrUX-Daten für beide Varianten gefunden.");
-  }
-
-  // Keep a tiny bit of metadata on the site root doc (useful for consoles/joins)
-  await metricsDocRef.set({ origin: true, url: pickedOrigin }, { merge: true });
-
-  const w_start = ymd(rec.collectionPeriod.firstDate);
-  const w_end   = ymd(rec.collectionPeriod.lastDate);
-  const dayId   = `${w_end}_all`;
-
-  // Store the record **raw** as we got it from CrUX
-  // plus minimal ingestion metadata next to it.
-  const payload = {
-    record: rec, // <-- raw CrUX record (key, metrics, collectionPeriod)
-    source: "crux_api",
-    fetchedAt: admin.firestore.FieldValue.serverTimestamp(),
-  };
-
-  await metricsDocRef.collection("daily-crux").doc(dayId).set(payload, { merge: false });
-
-  console.log(`OK: metrics/${TARGET_DOC_ID}/daily-crux/${dayId} (raw) for ${pickedOrigin}`);
 }
 
 run().catch(err => { console.error(err); process.exit(1); });
